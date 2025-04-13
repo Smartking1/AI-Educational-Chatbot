@@ -124,7 +124,7 @@ async def generate_chat(request: Request):
         # Initialize LLM client with the selected model
         init_client = LLMClient(
             groq_api_key=os.getenv("GROQ_API_KEY"),
-            secrets_path="C:/Users/DELL PC/EduBot/edubot/EduBot/edubot/gemini.json",
+            secrets_path="gemini.json",
             temperature=0.7,  # Set a default temperature or adjust if needed
             max_output_tokens=512
         )

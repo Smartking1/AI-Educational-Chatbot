@@ -1,0 +1,4 @@
+.env*
+gemini.json*
+Lib*
+.streamlit/secrets.toml

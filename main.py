@@ -1,112 +1,106 @@
 import os
 import streamlit as st
-from dotenv import load_dotenv
-import requests
+import tempfile
+import traceback
+import nest_asyncio
+from typing import List
+from llama_index.core import VectorStoreIndex, Document, PromptTemplate
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+import PyPDF2
+from utils.model import LLMClient
+import logging
+import uuid
 
-# Load environment variables
-load_dotenv()
+# Apply nest_asyncio to handle nested event loops
+nest_asyncio.apply()
 
-# Set API URL (assuming FastAPI is hosted locally)
-API_URL = "http://localhost:8000"
+# Set HuggingFace embedding model
+hf_embedding_model = HuggingFaceEmbedding(
+    model_name="BAAI/bge-small-en-v1.5"
+)
 
-# List of available models that the user can select from
-models = [
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "claude-3-5-sonnet",
-    "claude-3-haiku",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-]
+# Define a prompt template to structure the query
+prompt_template = PromptTemplate(
+    input_variables="query",
+    template="You are Bob, an AI assistant. Answer the following question concisely and clearly with only the answer: {query}"
+)
 
-# Initialize chat history and session_id in session state
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = None  # Store session ID returned from backend
+# In-memory storage for indices using session ID
+index_storage = {}
 
-# Function to send a document to the backend API for processing
-def send_document_to_api(uploaded_file):
-    files = {"files": (uploaded_file.name, uploaded_file, uploaded_file.type)}
-    try:
-        response = requests.post(f"{API_URL}/upload", files=files)
-        if response.status_code == 200:
-            data = response.json()
-            st.session_state.session_id = data['session_id']  # Store session ID in session state
-            return data  # Parse the JSON response if it's a success
-        else:
-            st.error(f"Error {response.status_code}: {response.text}")  # Show error if status is not 200
-            return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Failed to upload the document: {e}")
-        return None
+# Function to extract text from uploaded PDFs
+def extract_text_from_pdfs(uploaded_files):
+    document_text = ""
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            pdf_reader = PyPDF2.PdfReader(f)
+            for page in pdf_reader.pages:
+                document_text += page.extract_text()
+        os.remove(tmp_path)
+    return document_text
 
-# Function to send a query to the backend API for chat generation
-def generate_chat(model, question):
-    payload = {
-        "model": model,
-        "question": question,
-        "session_id": st.session_state.session_id  # Pass the session ID for index retrieval
-    }
-    try:
-        response = requests.post(f"{API_URL}/generate", json=payload)
-        if response.status_code == 200:
-            return response.text  # Return the response text if it's a success
-        else:
-            st.error(f"Error {response.status_code}: {response.text}")  # Handle error cases
-            return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Failed to get a response from the backend: {e}")
-        return None
+# Function to process uploaded files and generate vector index
+def process_files(uploaded_files):
+    document_text = extract_text_from_pdfs(uploaded_files)
+    document = Document(text=document_text)
+    index = VectorStoreIndex.from_documents([document], embed_model=hf_embedding_model)
+    session_id = str(uuid.uuid4())
+    index_storage[session_id] = index
+    return session_id
 
-# Main Streamlit App
-def main():
-    st.set_page_config(layout="wide")
+# Function to answer questions using the indexed data
+def qa_engine(query: str, index: VectorStoreIndex, llm_client, choice_k=3):
+    query_engine = index.as_query_engine(
+        llm=llm_client,
+        similarity_top_k=choice_k,
+        verbose=True,
+        Streaming=True,
+        prompt_template=prompt_template
+    )
+    response = query_engine.query(query)
+    answer = response.response.split("Answer:")[-1].strip()
+    return answer, response
 
-    # Sidebar for Model Selection and History
-    with st.sidebar:
-        st.header("Model Selection & Chat History")
+# Streamlit UI starts here
+st.title("📄 PDF Chat with AI")
 
-        # Dropdown to allow users to select from the available models
-        selected_model = st.selectbox("Select Model", models)
+uploaded_files = st.file_uploader("Upload your PDF files", type=["pdf"], accept_multiple_files=True)
 
-        # History section using session state
-        st.subheader("Chat History")
-        if st.session_state.chat_history:
-            for chat in st.session_state.chat_history:
-                st.write(f"Q: {chat['query']}\nA: {chat['response']}")
+if uploaded_files:
+    with st.spinner("Processing uploaded files..."):
+        session_id = process_files(uploaded_files)
+    st.success(f"Files processed. Session ID: {session_id}")
+    st.session_state["session_id"] = session_id
 
-    # Main area for Document Upload and Chat Interaction
-    st.title("Chat with your AI-Powered Educational Assistant")
-    st.subheader("Chat with your Educational Documents")
+    question = st.text_input("Ask a question based on the uploaded documents")
+    selected_model = st.selectbox("Choose a model", [ "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+        "claude-3-5-sonnet",
+        "claude-3-haiku",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",])
 
-    uploaded_file = st.file_uploader("Upload document(s)", type=['pdf'])
-
-    if uploaded_file:
-        response = send_document_to_api(uploaded_file)
-        if response:
-            st.success("Documents uploaded and processed successfully!")
-        else:
-            st.error(f"Error uploading document.")
-
-    # Chat interaction area
-    query = st.text_input("Ask a question:")
-
-    if st.button("Send Query") and uploaded_file and query:
+    if st.button("Generate Answer") and question:
         try:
-            response = generate_chat(selected_model, query)
-            if response:
-                # Add new query-response pair to session state history
-                st.session_state.chat_history.append({"query": query, "response": response})
-
-                # Display the chat in chat format
-                st.subheader("Chat")
-                for chat in st.session_state.chat_history:
-                    st.write(f"**You**: {chat['query']}")
-                    st.write(f"**AI**: {chat['response']}")
+            init_client = LLMClient(
+                groq_api_key=st.secrets.get("GROQ_API_KEY"),
+                gcp_credentials=st.secrets.get("gcp_service_account"),
+                #secrets_path=None,  # Not using external path, reading from secrets.toml directly
+                temperature=0.7,
+                max_output_tokens=512
+            )
+            llm_client = init_client.map_client_to_model(selected_model)
+            index = index_storage[st.session_state["session_id"]]
+            answer, response = qa_engine(question, index=index, llm_client=llm_client, choice_k=3)
+            st.markdown("**Answer:**")
+            st.write(answer)
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"An error occurred: {e}")
+            st.text(traceback.format_exc())
 
-if __name__ == "__main__":
-    main()
+st.sidebar.title("🛠 App Info")
+st.sidebar.markdown("This app allows you to chat with your uploaded PDFs using various LLMs.")
